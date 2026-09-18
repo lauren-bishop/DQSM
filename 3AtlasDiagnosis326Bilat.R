@@ -31,11 +31,11 @@ if (!dir.exists(OUTDIR)) {
 
 # Packages
 library(emmeans)
+library(lme4)
 library(readxl)
 library(ggplot2)
 library(dplyr)
 library(tidyr)
-
 
 # Check that files exist
 if (!file.exists(DIAG_FILE)) {
@@ -49,7 +49,6 @@ for (f in ROI_FILES) {
     stop("ROI file not found: ", path)
   }
 }
-
 
 # Extract numeric subject ID
 extract_id <- function(x) {
@@ -71,7 +70,6 @@ extract_id <- function(x) {
   })
 }
 
-
 # Read Excel or CSV file
 read_table <- function(path) {
   
@@ -85,7 +83,6 @@ read_table <- function(path) {
     stop("Unsupported file type: ", ext)
   }
 }
-
 
 # Read diagnosis file
 diag_raw <- read_table(DIAG_FILE)
@@ -130,7 +127,6 @@ names(diag) <- c(
   "Sex"
 )
 
-
 # Clean sex
 sex_raw <- trimws(toupper(as.character(diag$Sex)))
 
@@ -141,7 +137,6 @@ diag$Sex <- case_when(
 )
 
 diag <- diag[!is.na(diag$Sex), ]
-
 
 # Clean diagnosis and remove excluded subjects
 diag <- diag[diag$Diagnosis %in% DIAG_LEVELS, ]
@@ -161,7 +156,6 @@ diag$Diagnosis <- factor(
   levels = DIAG_LEVELS
 )
 
-
 # Create three-group variable
 diag$Group3 <- case_when(
   diag$Diagnosis == "HC" ~ "HC",
@@ -175,7 +169,6 @@ diag$Group3 <- factor(
   levels = c("HC", "PD", "Cognitive")
 )
 
-
 # Create two-group variable
 diag$Group2 <- ifelse(
   diag$Diagnosis == "HC",
@@ -187,7 +180,6 @@ diag$Group2 <- factor(
   diag$Group2,
   levels = c("Control", "Affected")
 )
-
 
 # Diagnosis summary
 message("Diagnosis loaded: ", nrow(diag), " subjects.")
@@ -201,7 +193,6 @@ print(table(diag$Group3))
 message("\nTwo-group counts:")
 print(table(diag$Group2))
 
-
 # Build master ROI table
 master_long_list <- list()
 
@@ -209,7 +200,6 @@ for (f in ROI_FILES) {
   
   path <- file.path(ROI_DIR, f)
   
-
   df <- read_table(path)
   
   if ("SubjectID" %in% names(df)) {
@@ -277,7 +267,6 @@ master_long <- merge(
 master_long$ROI <- factor(master_long$ROI)
 master_long$Age <- as.numeric(master_long$Age)
 
-
 # Main analysis function
 run_group_analysis <- function(
     data,
@@ -315,6 +304,7 @@ run_group_analysis <- function(
   )
   
   data$Sex <- factor(data$Sex)
+  data$Subject <- factor(data$Subject)
   
   results <- list()
   
@@ -325,12 +315,13 @@ run_group_analysis <- function(
     dsub <- data[data$Measure == m, ]
     
     dsub$Group <- droplevels(dsub$Group)
-    dsub$ROI <- droplevels(dsub$ROI)
+    dsub$ROI <- droplevels(factor(dsub$ROI))
+    dsub$Sex <- factor(dsub$Sex)
+    dsub$Subject <- factor(dsub$Subject)
     
     if (nlevels(dsub$Group) < 2) {
       next
     }
-    
     
     # Descriptive statistics
     desc_stats <- dsub %>%
@@ -346,25 +337,22 @@ run_group_analysis <- function(
         values_from = c(mean_QSM, sd_QSM, n)
       )
     
-    
-    # Model
-    model <- aov(
-      QSM ~ Age + Sex + Group * ROI,
-      data = dsub
+    # Mixed model with random intercept by subject
+    model <- lmer(
+      QSM ~ Age + Sex + Group * ROI + (1 | Subject),
+      data = dsub,
+      REML = FALSE
     )
-    
-    # lmer(QSM ~ Age + Sex + Group * ROI + (1 | subject ) ) last bit puts in a random effect per subject
-    # FDR across number of ROIs (not across the clinical variables) report both the 
     
     # Estimated marginal means
     emm <- emmeans(
       model,
       ~ Group | ROI,
-      cov.reduce = mean
+      cov.reduce = mean,
+      lmer.df = "asymptotic"
     )
     
-    
-    # Compare groups with reference group
+    # Compare groups against reference group
     ref_here <- if (ref_level %in% levels(dsub$Group)) {
       ref_level
     } else {
@@ -381,12 +369,53 @@ run_group_analysis <- function(
     res <- as.data.frame(
       summary(
         contrasts,
-        infer = TRUE
+        infer = TRUE,
+        lmer.df = "asymptotic"
       )
     )
     
     if (nrow(res) == 0) {
       next
+    }
+    
+    # emmeans with asymptotic df often uses z.ratio rather than t.ratio
+    ratio_col <- intersect(
+      c("z.ratio", "t.ratio"),
+      names(res)
+    )
+    
+    if (length(ratio_col) == 0) {
+      stop(
+        "Could not find z.ratio or t.ratio in emmeans output. Available columns: ",
+        paste(names(res), collapse = ", ")
+      )
+    }
+    
+    ratio_col <- ratio_col[1]
+    
+    required_cols <- c(
+      "ROI",
+      "contrast",
+      "estimate",
+      "SE",
+      "p.value"
+    )
+    
+    missing_cols <- setdiff(required_cols, names(res))
+    
+    if (length(missing_cols) > 0) {
+      stop(
+        "Missing expected columns from emmeans output: ",
+        paste(missing_cols, collapse = ", "),
+        ". Available columns are: ",
+        paste(names(res), collapse = ", ")
+      )
+    }
+    
+    res$test_statistic <- res[[ratio_col]]
+    
+    if (!"df" %in% names(res)) {
+      res$df <- Inf
     }
     
     res <- res[
@@ -397,7 +426,7 @@ run_group_analysis <- function(
         "estimate",
         "SE",
         "df",
-        "t.ratio",
+        "test_statistic",
         "p.value"
       )
     ]
@@ -428,12 +457,10 @@ run_group_analysis <- function(
     results[[m]] <- res
   }
   
-  
   if (length(results) == 0) {
     message("No results produced.")
     return(invisible(NULL))
   }
-  
   
   # Combine results
   all_results <- bind_rows(results)
@@ -444,24 +471,25 @@ run_group_analysis <- function(
     all_results$ROI
   )
   
+  # FDR across ROIs within each Measure and contrast combination
+  all_results <- all_results %>%
+    group_by(Measure, contrast) %>%
+    mutate(
+      p_fdr_roi = p.adjust(
+        p_value,
+        method = "BH"
+      ),
+      significant_roi_fdr = p_fdr_roi < alpha
+    ) %>%
+    ungroup()
   
-  # Global FDR
-  all_results$p_fdr_global <- p.adjust(
-    all_results$p_value,
-    method = "BH"
-  )
-  
-  all_results$significant_global <-
-    all_results$p_fdr_global < alpha
-  
-  
-  # Save global results
+  # Save ROI-level FDR results
   write.csv(
     all_results,
     file.path(
       sub_outdir,
       paste0(
-        "GLOBAL_FDR_",
+        "ROI_FDR_",
         analysis_name,
         ".csv"
       )
@@ -469,15 +497,14 @@ run_group_analysis <- function(
     row.names = FALSE
   )
   
-  
   # Significant results
   sig <- all_results %>%
-    filter(significant_global)
+    filter(significant_roi_fdr)
   
   if (nrow(sig) == 0) {
     
     message(
-      "No ROIs survive global FDR for ",
+      "No ROIs survive ROI-level FDR for ",
       analysis_name,
       "."
     )
@@ -498,11 +525,10 @@ run_group_analysis <- function(
           "contrast",
           "estimate",
           "p_value",
-          "p_fdr_global"
+          "p_fdr_roi"
         )
       ]
     )
-    
     
     # Plots
     for (i in seq_len(nrow(sig))) {
@@ -520,13 +546,13 @@ run_group_analysis <- function(
       )
       
       p_label <- if (
-        result$p_fdr_global < 0.001
+        result$p_fdr_roi < 0.001
       ) {
         "p_fdr < 0.001"
       } else {
         paste0(
           "p_fdr = ",
-          signif(result$p_fdr_global, 3)
+          signif(result$p_fdr_roi, 3)
         )
       }
       
@@ -601,7 +627,6 @@ run_group_analysis <- function(
   invisible(all_results)
 }
 
-
 # Run the three analyses
 
 res_full6 <- run_group_analysis(
@@ -633,7 +658,6 @@ res_two <- run_group_analysis(
   outdir = OUTDIR,
   alpha = ALPHA
 )
-
 
 # Demographic summaries
 write_demo_summary <- function(
@@ -676,7 +700,6 @@ write_demo_summary <- function(
   summary
 }
 
-
 write_demo_summary(
   diag,
   "Diagnosis",
@@ -706,9 +729,27 @@ write_demo_summary(
 
 summarise_significant <- function(results) {
   
+  if (is.null(results) || nrow(results) == 0) {
+    return(
+      data.frame(
+        Measure = character(),
+        contrast = character(),
+        direction = character(),
+        n_significant = integer()
+      )
+    )
+  }
+  
   results %>%
-    filter(p_fdr_global < 0.05) %>%
-    group_by(Measure, contrast) %>%
+    filter(significant_roi_fdr) %>%
+    mutate(
+      direction = ifelse(
+        estimate > 0,
+        "Higher",
+        "Lower"
+      )
+    ) %>%
+    group_by(Measure, contrast, direction) %>%
     summarise(
       n_significant = n(),
       .groups = "drop"
@@ -737,20 +778,6 @@ write.csv(
   row.names = FALSE
 )
 
-summarise_significant <- function(results) {
-  
-  results %>%
-    filter(p_fdr_global < 0.05) %>%
-    mutate(
-      direction = ifelse(
-        estimate > 0,
-        "Higher",
-        "Lower"
-      )
-    ) %>%
-    group_by(Measure, contrast, direction) %>%
-    summarise(
-      n_significant = n(),
-      .groups = "drop"
-    )
-}
+print(summary_full6)
+print(summary_three)
+print(summary_two)
